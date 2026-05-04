@@ -359,10 +359,10 @@ inline std::unique_ptr<geode::SimpleTextAreaImpl> geode::SimpleTextArea::createI
 
 using namespace geode::prelude;
 
-class RichTextArea::RichImpl : public SimpleTextAreaImpl {
+class geode::RichTextArea::RichImpl : public SimpleTextAreaImpl {
 public:
-    RichTextArea* m_self = nullptr;
-    RichImpl(RichTextArea* self)  : m_self(self), SimpleTextAreaImpl(self) {}
+    geode::RichTextArea* m_self = nullptr;
+    RichImpl(RichTextArea* self) : m_self(self), SimpleTextAreaImpl(self) {}
 
     std::map<std::string, std::shared_ptr<RichTextKeyBase>> m_richTextKeys;
     std::map<int, std::vector<std::shared_ptr<RichTextKeyInstanceBase>>> m_richTextInstances;
@@ -481,6 +481,20 @@ bool RichTextArea::init(std::string font, std::string text, float scale, float w
         }
     ));
 
+    auto redKey = std::make_shared<RichTextKey<std::monostate>>(
+        "cr",
+        [](std::string value) -> Result<std::monostate> {
+            if (!value.empty()) return Err("Must be empty!");
+
+            return Ok(std::monostate());
+        },
+        [](std::monostate const& value, cocos2d::CCFontSprite* sprite, int localIndex, int charIndex) {
+            sprite->setColor({ 255, 90, 90 });
+        }
+    );
+    redKey->setSpecialExits({"c"});
+    registerRichTextKey(redKey);
+
     // maybe one day someone will make this work but its fine :(
     // registerRichTextKey(std::make_shared<RichTextKey<std::string>>(
     //     "font",
@@ -518,6 +532,24 @@ bool RichTextArea::init(std::string font, std::string text, float scale, float w
 
 std::string RichTextArea::getRawText(){
     return castedImpl()->m_rawText;
+}
+
+void RichTextArea::updateContent(){
+    castedImpl()->formatRichText();
+    castedImpl()->updateContainer();
+}
+
+std::vector<std::shared_ptr<RichTextKeyBase>> RichTextArea::getTextKeys(){
+    if (!castedImpl()->m_richTextKeys.size()) return {};
+
+    std::vector<std::shared_ptr<RichTextKeyBase>> toReturn{};
+    toReturn.reserve(castedImpl()->m_richTextKeys.size());
+
+    for (auto const& [key, val] : castedImpl()->m_richTextKeys) {
+        toReturn.push_back(val);
+    }
+
+    return std::move(toReturn);
 }
 
 void RichTextArea::RichImpl::charIteration(geode::FunctionRef<cocos2d::CCLabelBMFont*(cocos2d::CCLabelBMFont* line, char c, float top)> overflowHandling) {
@@ -617,13 +649,15 @@ void RichTextArea::RichImpl::formatRichText() {
     };
     std::vector<MatchInfo> matches;
 
-    auto begin = m_text.cbegin();
-    auto end = m_text.cend();
+    auto textToModify = m_rawText;
+
+    auto begin = textToModify.cbegin();
+    auto end = textToModify.cend();
 
     int offset = 0;
 
     while (std::regex_search(begin, end, match, pattern)) {
-        int matchStartPos = std::distance(m_text.cbegin(), match[0].first);
+        int matchStartPos = std::distance(textToModify.cbegin(), match[0].first);
 
         std::string value = "";
         if (match.size() >= 4 && match[3].matched) value = match[3];
@@ -639,23 +673,54 @@ void RichTextArea::RichImpl::formatRichText() {
     for (auto it = matches.rbegin(); it != matches.rend(); ++it) {
         const auto& m = *it;
 
-        if (!m_richTextKeys.contains(m.key)) continue;
+        bool keyIsContained = m_richTextKeys.contains(m.key);
 
-        auto result = m_richTextKeys[m.key]->createInstance(m.value, m.cancellation);
+        std::set<std::string> keysToEffect{};
 
-        if (result.isErr()) continue;
+        if (!keyIsContained && m.cancellation){
+            for (const auto& [keyStr, keyBaseRef] : m_richTextKeys)
+            {
+                if (!keyBaseRef) continue;
 
-        int effectIndex = m.position - m.overallOffset;
+                if (!keyBaseRef->getSpecialExits().contains(m.key)){
+                    continue;
+                }
+                log::info("3");
 
-        auto& keyRef = result.unwrap();
-
-        if (richTextInstancesBeforeExtraOffset.contains(effectIndex)) {
-            richTextInstancesBeforeExtraOffset[effectIndex].push_back(keyRef);
-        } else {
-            richTextInstancesBeforeExtraOffset[effectIndex] = {keyRef};
+                keysToEffect.insert(keyStr);
+            }
+        }
+        else if (!keyIsContained){
+            continue;
         }
 
-        m_text.erase(m.position, m.length);
+        if (!keysToEffect.contains(m.key)) {
+            keysToEffect.insert(m.key);
+        }
+
+        for (const auto& keyStr : keysToEffect)
+        {
+            auto it = m_richTextKeys.find(keyStr);
+            if (it == m_richTextKeys.end() || !it->second) {
+                continue;
+            }
+
+            auto result = it->second->createInstance(m.value, m.cancellation);
+
+            if (result.isErr()) continue;
+
+            int effectIndex = m.position - m.overallOffset;
+
+            auto keyRef = result.unwrap();
+
+            if (richTextInstancesBeforeExtraOffset.contains(effectIndex)) {
+                richTextInstancesBeforeExtraOffset[effectIndex].push_back(keyRef);
+            } else {
+                richTextInstancesBeforeExtraOffset[effectIndex] = {keyRef};
+            }
+        }
+
+        textToModify.erase(m.position, m.length);
     }
 
     int textAdditionOverallOffset = 0;
@@ -666,7 +731,7 @@ void RichTextArea::RichImpl::formatRichText() {
         {
             auto currentAddition = keyRef->runStrAddition();
             if (currentAddition == "") continue;
-            m_text.insert(index + textAdditionOverallOffset, currentAddition);
+            textToModify.insert(index + textAdditionOverallOffset, currentAddition);
             textAdditionOverallOffset += currentAddition.length();
         }
 
@@ -674,6 +739,8 @@ void RichTextArea::RichImpl::formatRichText() {
 
         prevExtraOffset = textAdditionOverallOffset;
     }
+
+    m_text = std::move(textToModify);
 }
 
 void RichTextArea::RichImpl::processLinkClick(
